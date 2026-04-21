@@ -56,6 +56,11 @@ class QPU:
         # Instruction trace
         self.trace: List[str] = []
 
+        # SPEAK output: phrase string emitted by op_speak (None until spoken)
+        self.speak_output: Optional[str] = None
+        # CHAIN annotations: list of (stage_id, reg) for pipeline handoff
+        self.chain_ops: List[Tuple[int, int]] = []
+
     def reset(self):
         self.regs[:] = 0
         self.pc = 0
@@ -65,6 +70,8 @@ class QPU:
         self.halt_flag = False
         self.cycles = 0
         self.trace = []
+        self.speak_output = None
+        self.chain_ops = []
 
     # --- Core 6 opcodes (array-native) ---
 
@@ -188,6 +195,50 @@ class QPU:
     def op_ztest(self, rs: int):
         """ZTEST rs — set zero_flag if ALL elements of rs are zero. 1 cycle instead of 5 FOLDs."""
         self.zero_flag = np.all(self.regs[rs] == 0)
+        self.cycles += 1
+
+    def op_speak(self, rd: int):
+        """SPEAK rd — GF(4) register → K-address → SpeakSpellCache phrase.
+
+        FOLDs rd to 4 suit scores, picks winning suit + rank, constructs
+        K-address (+rankS), looks up in SpeakSpellCache. Result stored in
+        self.speak_output (string). Register rd is unchanged.
+        """
+        SUITS = ["H", "S", "D", "C"]
+        v = self.regs[rd].copy()
+        # FOLD 32 → 4 suit scores via XOR reduction
+        scores = [0, 0, 0, 0]
+        for i, elem in enumerate(v):
+            scores[i % 4] ^= int(elem)
+        winning_suit_idx = int(np.argmax(scores))
+        suit = SUITS[winning_suit_idx]
+        # Rank: count non-zero elements, map to 1-13
+        nonzero = int(np.count_nonzero(v))
+        rank = max(1, min(13, nonzero // 2 + 1))
+        k_addr = f"+{rank}{suit}"
+        # Try SpeakSpellCache; fall back to K-address string on import failure
+        try:
+            import sys as _sys
+            _root = str(__file__).split("apps")[0]
+            if _root not in _sys.path:
+                _sys.path.insert(0, _root)
+            from cell.isochip.speakspell_cache import SpeakSpellCache
+            _cache = SpeakSpellCache().build()
+            phrase = _cache.lookup(k_addr, "general") or k_addr
+        except Exception:
+            phrase = k_addr
+        self.speak_output = phrase
+        self.cycles += 1
+
+    def op_chain(self, rd: int, stage_id: int):
+        """CHAIN rd, stage_id — annotate register for pipeline handoff.
+
+        Appends (stage_id, rd) to self.chain_ops. The pipeline runner
+        reads chain_ops after execution to route output to the next stage.
+        Stage IDs: 0=speak, 1=polish(prose_chips), 2=bone, 3=boneyard.
+        Register rd is unchanged.
+        """
+        self.chain_ops.append((stage_id, rd))
         self.cycles += 1
 
     # --- Layer 1: Multi-digit arithmetic (carry chain) ---
@@ -513,6 +564,40 @@ class QPU:
 
         self.cycles += 1
 
+    def op_polar(self, rd: int):
+        """POLAR rd — PolarQuant-style 2D angular extraction. 32→16 elements.
+
+        Groups 32 GF(4) elements into 16 consecutive pairs (a, b).
+        For each pair, extracts the polar quadrant (angle in 4-quadrant GF4 space):
+          angle = ((a >> 1) << 1) | (b >> 1)  → {0,1,2,3} = {H,S,D,C}
+
+        This preserves the angular/directional structure of each pair before
+        further FOLD reduction, giving better inner-product preservation than
+        naive XOR-fold alone.
+
+        TurboQuant pipeline in QASM (rotation → polar → reduce → speak):
+          FMIX r0, 7, 0   ; rotate: spread information uniformly
+          POLAR r0         ; extract 16 pairwise angles (PolarQuant step)
+          FOLD r0, 2       ; reduce 16→8 suit scores
+          FOLD r0, 2       ; reduce 8→4 final scores
+          SPEAK r0         ; decode winning suit+rank → K-address phrase
+
+        Unused upper 16 slots are zeroed. Register shape stays WORD_SIZE=32
+        but only slots [0:16] carry meaningful data after this op.
+        """
+        v = self.regs[rd].copy()
+        result = np.zeros(self.WORD_SIZE, dtype=np.uint8)
+        n_pairs = self.WORD_SIZE // 2  # 16
+        for i in range(n_pairs):
+            a = int(v[i * 2])
+            b = int(v[i * 2 + 1])
+            # High bits encode polar quadrant (suit quadrant in GF4 space)
+            angle = ((a >> 1) << 1) | (b >> 1)
+            result[i] = angle
+        self.regs[rd] = result
+        self.zero_flag = np.all(result == 0)
+        self.cycles += 1
+
 
 # ================================================================
 # Assembler — text → program
@@ -530,6 +615,10 @@ class QAssembler:
         'CALL': 'call',  # CALL addr — push PC, jump
         'RET': 'ret',    # RET — pop PC, return
         'ZTEST': 'ztest',  # ZTEST rs — set zero flag from full register (1 cycle)
+        # Pipeline opcodes
+        'SPEAK': 'speak',  # SPEAK rd — GF(4) reg → K-address → SpeakSpellCache phrase
+        'CHAIN': 'chain',  # CHAIN rd, stage_id — annotate reg for pipeline handoff
+        'POLAR': 'polar',  # POLAR rd — PolarQuant 2D angular extraction, 32→16 pairs
         # Layer 1: Multi-digit arithmetic
         'CADD': 'cadd',  # CADD rd, rs — base-4 add with carry
         'CSUB': 'csub',  # CSUB rd, rs — base-4 sub with borrow
@@ -665,6 +754,12 @@ def execute(qpu: QPU, program: List[Tuple], max_cycles: int = 10000,
             qpu.op_ret()
         elif op == 'ztest':
             qpu.op_ztest(args[0][1])
+        elif op == 'speak':
+            qpu.op_speak(args[0][1])
+        elif op == 'chain':
+            qpu.op_chain(args[0][1], args[1][1])
+        elif op == 'polar':
+            qpu.op_polar(args[0][1])
         # Layer 1: Multi-digit arithmetic
         elif op == 'cadd':
             qpu.op_carry_add(args[0][1], args[1][1])

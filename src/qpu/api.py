@@ -66,31 +66,31 @@ def run(source: str, mem_init: dict = None, max_cycles: int = 100000) -> QPUResu
     return QPUResult(qpu)
 
 
-def run_gpu(source: str, batch_size: int = 10000, device: str = 'cuda') -> QPUResult:
-    """Execute QASM on GPU via compiled tensor ops.
+def run_gpu(source: str, batch_size: int = 10000, device=None) -> QPUResult:
+    """Execute QASM on best available backend via compiled tensor ops.
 
     Args:
         source: QASM assembly text
         batch_size: number of parallel QPU instances
-        device: 'cuda' or 'cpu'
+        device: None=auto-detect, or 'cuda'/'cpu'/'mps'/DirectML device
 
     Returns:
         QPUResult from first batch element
     """
     try:
         import torch
-        from .compiler import QASMtoGPU
+        from .compiler import QASMtoGPU, detect_device
     except ImportError:
-        raise ImportError("GPU execution requires PyTorch: pip install torch")
+        raise ImportError("Tensor execution requires PyTorch: pip install torch")
 
     asm = QAssembler()
     program = asm.assemble(source)
 
-    compiler = QASMtoGPU(device=device)
+    compiler = QASMtoGPU(device=device)  # None = auto-detect
     gpu_fn = compiler.compile(program)
 
     batch_input = torch.randint(0, 4, (batch_size, QPU.WORD_SIZE),
-                                dtype=torch.int32, device=device)
+                                dtype=torch.int32, device=compiler.device)
     output = gpu_fn(batch_input)
 
     # Build result from first batch element
@@ -117,7 +117,7 @@ def from_c(source: str) -> str:
     return transpiler.compile(source)
 
 
-def jit(fn: Optional[Callable] = None, *, device: str = 'cuda', batch_size: int = 10000):
+def jit(fn: Optional[Callable] = None, *, device=None, batch_size: int = 10000):
     """JIT decorator: compile a Python function's QASM body to GPU.
 
     Usage:
@@ -149,11 +149,11 @@ def jit(fn: Optional[Callable] = None, *, device: str = 'cuda', batch_size: int 
                     from .compiler import QASMtoGPU
                     asm = QAssembler()
                     program = asm.assemble(source)
-                    compiler = QASMtoGPU(device=device)
+                    compiler = QASMtoGPU(device=device)  # None = auto-detect
                     _compiled[cache_key] = {
                         'gpu_fn': compiler.compile(program),
                         'program': program,
-                        'device': device,
+                        'device': compiler.device,
                         'batch_size': batch_size,
                     }
                 except ImportError:
@@ -169,7 +169,7 @@ def jit(fn: Optional[Callable] = None, *, device: str = 'cuda', batch_size: int 
                 import torch
                 batch_input = torch.randint(
                     0, 4, (batch_size, QPU.WORD_SIZE),
-                    dtype=torch.int32, device=device
+                    dtype=torch.int32, device=entry['device']
                 )
                 output = entry['gpu_fn'](batch_input)
                 qpu = QPU()

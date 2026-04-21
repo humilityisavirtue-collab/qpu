@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-qasm_compiler.py — Compile QASM programs to Triton GPU kernels.
+qasm_compiler.py -- Compile QASM programs to batched tensor ops.
 
-QASM (emulated, 1.9M tok/s) -> Triton (GPU native, target: 100M+ tok/s)
+QASM (emulated, 1.9M tok/s) -> GPU/NPU (target: 100M+ tok/s)
 
-The compiler reads QASM instruction lists and emits fused Triton kernels
-that execute the entire program in one GPU launch. No Python dispatch
-per instruction. One kernel. All instructions fused.
+Backend detection priority: ROCm > CUDA > DirectML > MPS > CPU
+GF(4) ADD = XOR = native instruction on every backend (VPXOR/shader XOR/NPU XOR).
+
+Z13 note: Ryzen AI MAX+ has CPU+iGPU+NPU sharing one unified memory pool.
+GF(4) ops need zero copies between units -- the same buffer is native XOR on all three.
+DirectML on Windows exposes the iGPU without driver friction (pip install torch-directml).
+NPU path (XDNA 2 / VitisAI EP) uses ONNX Runtime -- see qpu_npu.py (future).
 
 K-address: +5C (THE FLOW)
 """
@@ -14,8 +18,13 @@ K-address: +5C (THE FLOW)
 import numpy as np
 import torch
 import time
-import math
-from typing import List, Tuple
+import platform
+import warnings
+from typing import List, Optional, Tuple
+
+# torch.roll has no DirectML kernel but falls back to CPU efficiently on unified-memory
+# systems (Z13 ROG Flow, etc.) -- no copy cost. Suppress the noise.
+warnings.filterwarnings('ignore', message=".*aten::roll.*DML.*")
 
 try:
     import triton
@@ -29,15 +38,68 @@ from .core import QPU, QAssembler, execute
 
 
 # ================================================================
+# Backend detection
+# ================================================================
+
+def detect_device() -> Tuple[object, str]:
+    """Detect best available compute backend for GF(4) tensor ops.
+
+    Returns: (device, backend_label)
+      device -- torch.device or DirectML device object
+      backend_label -- human-readable string for display
+
+    Priority: ROCm > CUDA > DirectML > MPS > CPU(AVX)
+
+    GF(4) ADD = XOR is a native instruction on every backend:
+      CUDA/ROCm : CUDA XOR intrinsic
+      DirectML  : DX12 shader bitwise XOR
+      MPS       : Metal shader XOR
+      CPU       : VPXOR (AVX-512) via numpy
+    """
+    # ROCm (AMD -- uses the CUDA interface in PyTorch ROCm builds)
+    if torch.cuda.is_available() and getattr(torch.version, 'hip', None):
+        name = torch.cuda.get_device_name(0)
+        return torch.device('cuda'), f'ROCm ({name})'
+
+    # CUDA (NVIDIA)
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        return torch.device('cuda'), f'CUDA ({name})'
+
+    # DirectML -- AMD/Intel/NVIDIA on Windows via DX12, no driver install beyond GPU driver
+    # pip install torch-directml
+    try:
+        import torch_directml as dml
+        dev = dml.device()
+        try:
+            label = dml.device_name(dml.default_device())
+        except Exception:
+            label = 'DirectML GPU'
+        return dev, f'DirectML ({label})'
+    except ImportError:
+        pass
+
+    # MPS (Apple Silicon unified memory -- same idea as Z13 but Apple)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps'), 'MPS (Apple Silicon)'
+
+    # CPU -- numpy uses VPXOR via AVX-512 on Zen 5, GF(4) ADD is native
+    cpu = platform.processor()
+    avx = 'AVX-512/VPXOR' if 'AMD' in cpu or 'Intel' in cpu else 'CPU'
+    return torch.device('cpu'), f'CPU ({avx})'
+
+
+# ================================================================
 # Approach: Unroll QASM programs into fused PyTorch ops
 #
 # Instead of compiling to Triton JIT (which has limitations on
 # dynamic control flow), we compile QASM -> fused PyTorch tensor ops
-# that run on GPU. One torch function per program.
-# The GPU parallelism comes from running BATCH of programs simultaneously.
+# that run on the detected backend. One torch function per program.
+# GPU parallelism: run BATCH of programs simultaneously.
+# Unified-memory systems (Z13, Apple): zero-copy between CPU/GPU/NPU.
 # ================================================================
 
-# GF(4) tables on GPU
+# GF(4) tables (will be moved to detected device on init)
 GF4_ADD_GPU = torch.tensor([
     [0,1,2,3],[1,0,3,2],[2,3,0,1],[3,2,1,0]
 ], dtype=torch.int32)
@@ -48,17 +110,25 @@ GF4_MUL_GPU = torch.tensor([
 
 
 class QASMtoGPU:
-    """Compile QASM programs to batched GPU execution.
+    """Compile QASM programs to batched tensor execution.
 
     Takes a QASM program (list of instructions) and produces
-    a GPU function that runs it on a batch of inputs simultaneously.
-    Every 'register' becomes a (batch, WORD_SIZE) tensor.
+    a function that runs it on a batch of inputs simultaneously.
+    Every register becomes a (batch, WORD_SIZE) tensor.
+
+    Pass device=None (default) to auto-detect the best backend.
+    Pass device='cpu'/'cuda'/'mps' to force a specific backend.
     """
 
     WORD_SIZE = 32
 
-    def __init__(self, device='cuda'):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    def __init__(self, device=None):
+        if device is None:
+            self.device, self.backend = detect_device()
+        else:
+            # Accept string or torch.device; keep label minimal
+            self.device = torch.device(device) if isinstance(device, str) else device
+            self.backend = str(self.device)
         self.add_table = GF4_ADD_GPU.to(self.device)
         self.mul_table = GF4_MUL_GPU.to(self.device)
 
@@ -157,6 +227,8 @@ class QASMtoGPU:
                         offset = 1
                     left = regs[:, rd, :half].clone()
                     right = regs[:, rd, half:].clone()
+                    # torch.roll falls back to CPU on DirectML, but on unified-memory
+                    # systems (Z13/ROG Flow) there is no copy cost -- it's still fast.
                     if layer_idx % 2 == 0:
                         right_rotated = torch.roll(right, -offset, dims=1)
                         regs[:, rd, :half] = left ^ right_rotated
@@ -165,9 +237,21 @@ class QASMtoGPU:
                         regs[:, rd, half:] = right ^ left_rotated
 
                 elif op_type == 'roll':
-                    # Feistel mix as native op
                     rd, offset = op_args
                     regs[:, rd] = torch.roll(regs[:, rd], -offset, dims=1)
+
+                elif op_type == 'polar':
+                    # PolarQuant 2D angular extraction: 32 elements → 16 polar angles.
+                    # angle[i] = ((a >> 1) << 1) | (b >> 1) for pair (a, b).
+                    # Fully vectorized: no Python loop, runs on GPU/NPU natively.
+                    rd = op_args[0]
+                    v = regs[:, rd]          # (B, 32) int32
+                    a = v[:, 0::2]           # (B, 16) even elements
+                    b = v[:, 1::2]           # (B, 16) odd elements
+                    angle = ((a >> 1) << 1) | (b >> 1)   # (B, 16) polar quadrants
+                    result = torch.zeros(B, W, dtype=torch.int32, device=self.device)
+                    result[:, :W // 2] = angle
+                    regs[:, rd] = result
 
             return regs[:, 0], {"regs": regs, "mem": gpu_mem}
 
@@ -244,6 +328,23 @@ class QASMtoGPU:
                     f"Use the CPU emulator for programs with loops/branches/calls."
                 )
 
+            elif op == 'speak':
+                # SPEAK exits the GPU kernel — GPU returns the GF4 vector and
+                # the caller runs SpeakSpellCache on the CPU.
+                ops.append(('speak_handoff', (args[0][1],)))
+
+            elif op == 'chain':
+                # CHAIN is a no-op in GPU context — stage routing is handled by
+                # the Python pipeline runner after the kernel returns.
+                pass
+
+            elif op == 'polar':
+                # POLAR: PolarQuant 2D angular extraction, 32→16 polar-encoded elements.
+                # Implemented as tensor ops: extract high bits of each element,
+                # pack pairs into angular quadrant values.
+                rd = args[0][1]
+                ops.append(('polar', (rd,)))
+
         return ops
 
     def _init_memory(self, memory_init: dict = None) -> torch.Tensor:
@@ -261,14 +362,14 @@ class QASMtoGPU:
 # ================================================================
 
 def benchmark():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, backend = detect_device()
     print("=" * 60)
-    print(f"  QASM Compiler — Assembly to GPU")
-    print(f"  Device: {device}")
+    print(f"  QASM Compiler -- GF(4) tensor ops")
+    print(f"  Backend: {backend}")
     print("=" * 60)
 
     asm = QAssembler()
-    compiler = QASMtoGPU(str(device))
+    compiler = QASMtoGPU()  # auto-detect
 
     # --- Program: Plinko inference (4 layers) ---
     # Plinko with explicit Feistel mix after each layer
@@ -338,16 +439,16 @@ HALT
         # Warmup
         for _ in range(3):
             _, _ = gpu_fn(inputs_gpu)
-        if device.type == 'cuda':
+        if torch.cuda.is_available() and hasattr(device, 'type') and device.type == 'cuda':
             torch.cuda.synchronize()
 
         n_iter = 50 if batch_size <= 10000 else 10
-        if device.type == 'cuda':
+        if torch.cuda.is_available() and hasattr(device, 'type') and device.type == 'cuda':
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(n_iter):
             _, _ = gpu_fn(inputs_gpu)
-        if device.type == 'cuda':
+        if torch.cuda.is_available() and hasattr(device, 'type') and device.type == 'cuda':
             torch.cuda.synchronize()
         gpu_elapsed = (time.perf_counter() - t0) / n_iter
 

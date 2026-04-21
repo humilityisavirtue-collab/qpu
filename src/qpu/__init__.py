@@ -44,3 +44,4 @@ from .bootstrap import (
 )
 from .transpiler import C2QASM
 from .api import run, jit, from_c, benchmark
+from .agent import QPUAgentLoop, AgentResult, run_agent
