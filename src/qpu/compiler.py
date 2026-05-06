@@ -15,12 +15,20 @@ NPU path (XDNA 2 / VitisAI EP) uses ONNX Runtime -- see qpu_npu.py (future).
 K-address: +5C (THE FLOW)
 """
 
+from __future__ import annotations  # lazy-eval annotations so torch refs don't fail on CPU-only installs
+
 import numpy as np
-import torch
 import time
 import platform
 import warnings
 from typing import List, Optional, Tuple
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    HAS_TORCH = False
 
 # torch.roll has no DirectML kernel but falls back to CPU efficiently on unified-memory
 # systems (Z13 ROG Flow, etc.) -- no copy cost. Suppress the noise.
@@ -56,6 +64,11 @@ def detect_device() -> Tuple[object, str]:
       MPS       : Metal shader XOR
       CPU       : VPXOR (AVX-512) via numpy
     """
+    if not HAS_TORCH:
+        raise ImportError(
+            "GPU compilation requires PyTorch. Install with: pip install qpu[gpu]"
+        )
+
     # ROCm (AMD -- uses the CUDA interface in PyTorch ROCm builds)
     if torch.cuda.is_available() and getattr(torch.version, 'hip', None):
         name = torch.cuda.get_device_name(0)
@@ -99,14 +112,19 @@ def detect_device() -> Tuple[object, str]:
 # Unified-memory systems (Z13, Apple): zero-copy between CPU/GPU/NPU.
 # ================================================================
 
-# GF(4) tables (will be moved to detected device on init)
-GF4_ADD_GPU = torch.tensor([
-    [0,1,2,3],[1,0,3,2],[2,3,0,1],[3,2,1,0]
-], dtype=torch.int32)
+# GF(4) tables (will be moved to detected device on init).
+# Built lazily so the package imports cleanly on CPU-only installs (no torch).
+if HAS_TORCH:
+    GF4_ADD_GPU = torch.tensor([
+        [0,1,2,3],[1,0,3,2],[2,3,0,1],[3,2,1,0]
+    ], dtype=torch.int32)
 
-GF4_MUL_GPU = torch.tensor([
-    [0,0,0,0],[0,1,2,3],[0,2,3,1],[0,3,1,2]
-], dtype=torch.int32)
+    GF4_MUL_GPU = torch.tensor([
+        [0,0,0,0],[0,1,2,3],[0,2,3,1],[0,3,1,2]
+    ], dtype=torch.int32)
+else:
+    GF4_ADD_GPU = None
+    GF4_MUL_GPU = None
 
 
 class QASMtoGPU:
