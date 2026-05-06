@@ -29,6 +29,11 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["torch>=2.0"]
 all = ["torch>=2.0"]
+dev = [
+    "pytest>=7.0",
+    "build",
+    "twine",
+]
 
 [project.urls]
 Homepage = "https://github.com/humilityisavirtue-collab/qpu"
@@ -38,7 +43,11 @@ Repository = "https://github.com/humilityisavirtue-collab/qpu"
 qpu = "qpu.cli:main"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/qpu"]
+include = ["src/qpu", "tests", "README.md", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qpu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,21 @@
+# Normalize line endings — text files use LF on commit regardless of host OS.
+# Stops Windows checkouts from triggering "LF will be replaced by CRLF" warnings
+# and keeps diffs clean across collaborators on different platforms.
+
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+
+# Treat these as binary so git doesn't mangle them
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.pdf   binary
