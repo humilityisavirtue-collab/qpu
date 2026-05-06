@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "qpu"
+name = "qpulite"
 version = "0.1.0"
-description = "Quaternary Processing Unit — GF(4) co-processor accelerator"
+description = "QPU-Lite — the demo surface of the Quaternary Processing Unit. GF(4) SIMD ISA, emulator, C transpiler, and GPU compiler."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/humilityisavirtue-collab/qpu"
-Repository = "https://github.com/humilityisavirtue-collab/qpu"
+Homepage = "https://github.com/humilityisavirtue-collab/qpulite"
+Repository = "https://github.com/humilityisavirtue-collab/qpulite"
 
 [project.scripts]
 qpu = "qpu.cli:main"

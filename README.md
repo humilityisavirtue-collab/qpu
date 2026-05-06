@@ -1,12 +1,21 @@
-# QPU — Quaternary Processing Unit
+# QPU-Lite
 
-A small SIMD instruction set over GF(4) — the Galois field with four elements {0, 1, 2, 3}. Addition is XOR. Multiplication is a 16-byte cache-resident lookup. The package includes the ISA, a Python emulator, a C-subset → QASM transpiler, and a QASM → PyTorch GPU compiler.
+The demo surface of the **Quaternary Processing Unit** project. A small SIMD instruction set over GF(4) — the Galois field with four elements {0, 1, 2, 3} — packaged for `pip install`. Addition is XOR. Multiplication is a 16-byte cache-resident lookup. Includes the ISA, a Python emulator, a C-subset → QASM transpiler, and a QASM → PyTorch GPU compiler.
+
+The full QPU stack — including the CUDA GF(4) attention-similarity kernel, the QuaternaryLinear / QuaternaryMatmul transformer integration layer, the gcc-vs-numpy-vs-QPU benchmark harness, and the papers — lives in the parent project. This package is what you can `pip install` and play with today.
 
 ## Install
 
 ```bash
-pip install qpu            # CPU emulator only
-pip install qpu[gpu]       # With GPU compiler (requires PyTorch + CUDA)
+pip install qpulite            # CPU emulator only
+pip install qpulite[gpu]       # With GPU compiler (requires PyTorch + CUDA)
+```
+
+The Python import name is still `qpu`:
+
+```python
+import qpu
+qpu.run("SET r0, 1\nHALT")
 ```
 
 ## Scope

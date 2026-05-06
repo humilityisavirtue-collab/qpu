@@ -66,7 +66,7 @@ def detect_device() -> Tuple[object, str]:
     """
     if not HAS_TORCH:
         raise ImportError(
-            "GPU compilation requires PyTorch. Install with: pip install qpu[gpu]"
+            "GPU compilation requires PyTorch. Install with: pip install qpulite[gpu]"
         )
 
     # ROCm (AMD -- uses the CUDA interface in PyTorch ROCm builds)
